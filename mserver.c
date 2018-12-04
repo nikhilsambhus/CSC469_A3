@@ -115,6 +115,7 @@ typedef struct _server_node {
 	// Server process PID (it is a child process of mserver)
 	pid_t pid;
 
+	time_t latest_alive;
 	// TODO: add fields for necessary additional server state information
 	// ...
 
@@ -124,6 +125,8 @@ typedef struct _server_node {
 static int num_servers = 0;
 // Server state information
 static server_node *server_nodes = NULL;
+
+static int failed_server_id = -1;
 
 // Read the configuration file, fill in the server_nodes array
 // Returns false if the configuration is invalid
@@ -240,7 +243,7 @@ static void cleanup()
 		for (int i = 0; i < num_servers; i++) {
 			server_node *node = &(server_nodes[i]);
 
-			if (node->socket_fd_out != -1) {
+			if (node->socket_fd_out != -1 && failed_server_id != i) {
 				// Request server shutdown
 				server_ctrl_request request = {0};
 				request.hdr.type = MSG_SERVER_CTRL_REQ;
@@ -483,12 +486,52 @@ static bool process_server_message(int fd)
 
 	// TODO: read and process the message
 	// ...
-	(void)fd;
+	char req_buffer[MAX_MSG_LEN] = {0};
+
+	if(!recv_msg(fd, req_buffer, MAX_MSG_LEN, MSG_MSERVER_CTRL_REQ)) {
+		log_write("Error server message, closing connection\n");
+		return false;
+	}
+
+	mserver_ctrl_request *request = (mserver_ctrl_request *)req_buffer; 
+
+	switch(request->type) {
+		case HEARTBEAT:
+			server_nodes[request->server_id].latest_alive = time(NULL);
+			return true;
+			break;
+		default:
+			log_write("Server message Invalid command\n");
+	}
+	
 	return false;
 }
 
 
 static const int select_timeout_interval = 1;// seconds
+
+static time_t hbeat_timer = 0;
+
+
+int monitor_heartbeat(int *sid) {
+
+	if(hbeat_timer == 0) { //initialization
+		hbeat_timer = time(NULL);
+	}
+	else if((time(NULL) - hbeat_timer) >= default_server_timeout) {
+		for (int i = 0; i < num_servers; i++) {
+			if(server_nodes[i].latest_alive <= hbeat_timer) {
+				hbeat_timer = time(NULL); //reset
+				*sid = i;
+				failed_server_id = i;	
+				log_write("Server %d is dead\n", i);
+				return -1;
+			}
+		}
+		hbeat_timer = time(NULL); //reset
+	}
+	return 0;	
+}
 
 // Returns false if stopped due to errors, true if shutdown was requested
 static bool run_mserver_loop()
@@ -505,6 +548,7 @@ static bool run_mserver_loop()
 	for (int i = 0; i < num_servers; i++) {
 		FD_SET(server_nodes[i].socket_fd_in, &allset);
 		max_server_fd = max(max_server_fd, server_nodes[i].socket_fd_in);
+		server_nodes[i].latest_alive = time(NULL);
 	}
 
 	int maxfd = max(clients_fd, servers_fd);
@@ -518,7 +562,12 @@ static bool run_mserver_loop()
 		struct timeval time_out;
 		time_out.tv_sec = select_timeout_interval;
 		time_out.tv_usec = 0;
-
+		
+		int sid;
+		if(monitor_heartbeat(&sid) == -1) {
+			log_write("Server failure detected, server id %d\n", sid);
+			log_error("Server failure detected, server id %d\n", sid);
+		}
 		// Wait with timeout (in order to be able to handle asynchronous events such as heartbeat messages)
 		int num_ready_fds = select(maxfd + 1, &rset, NULL, NULL, &time_out);
 		if (num_ready_fds < 0) {

@@ -57,6 +57,7 @@ static int num_servers = 0;
 // Log file name
 static char log_file_name[PATH_MAX] = "";
 
+static bool shutdown_flag = false;
 
 static void usage(char **argv)
 {
@@ -128,6 +129,29 @@ static void cleanup();
 
 static const int hash_size = 65536;
 
+static const int heartbeat_interval = 1;
+
+static pthread_t hb_t;
+
+void *send_heartbeat() {
+	mserver_ctrl_request hb_req;
+	hb_req.type = HEARTBEAT;
+	hb_req.server_id = server_id;
+	hb_req.hdr.type = MSG_MSERVER_CTRL_REQ;
+	char req_buffer[sizeof(hb_req)];
+
+	while(1) {
+		sleep(heartbeat_interval);
+		if(shutdown_flag == true) {
+			return NULL;
+		}
+		memcpy(req_buffer, &hb_req, sizeof(hb_req));
+		if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
+			log_write("Error while sending heartbeat to metadata\n");
+		}
+	}	
+
+}
 // Initialize and start the server
 static bool init_server()
 {
@@ -164,9 +188,13 @@ static bool init_server()
 		goto cleanup;
 	}
 
+	if (!hash_init(&secondary_hash, hash_size)) {
+		goto cleanup;
+	}
 	// TODO: Create a separate thread that takes care of sending periodic heartbeat messages
 	// ...
 
+	pthread_create(&hb_t, NULL, &send_heartbeat, NULL);
 	log_write("Server initialized\n");
 	return true;
 
@@ -209,12 +237,41 @@ static void cleanup()
 	hash_iterate(&primary_hash, clean_iterator_f, NULL);
 	hash_cleanup(&primary_hash);
 
+	hash_iterate(&secondary_hash, clean_iterator_f, NULL);
+	hash_cleanup(&secondary_hash);
+
 	// TODO: release all other resources
 	// ...
 
 }
 
+//Replicate by sending to secondary server and wait for confirmation
+static bool replicate_put(operation_request *request) {
+	//return true;
+	size_t value_size = request->hdr.length - sizeof(*request);
+	
+	log_write("Entered replicate \n");
+	char *req_buffer = malloc(sizeof(*request) + value_size);
+	if(req_buffer == NULL) {
+		return false;
+	}
+	else {
+		memcpy(req_buffer, request, sizeof(*request) + value_size);
+	}
+	char recv_buffer[MAX_MSG_LEN] = {0};
 
+	while(secondary_fd == -1);
+        if (!send_msg(secondary_fd, req_buffer, sizeof(*request) + value_size) || !recv_msg(secondary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP))
+        {
+		log_write("Failed replicate\n");
+		free(req_buffer);
+                return false;
+	}
+	log_write("Success replicate\n");
+	free(req_buffer);
+	return true;
+	
+}
 // Connection will be closed after calling this function regardless of result
 static void process_client_message(int fd)
 {
@@ -258,11 +315,15 @@ static void process_client_message(int fd)
 			size_t size = 0;
 
 			// Get the value for requested key from the hash table
+			// acquire lock
+			hash_lock(&primary_hash, request->key);
 			if (!hash_get(&primary_hash, request->key, &data, &size)) {
+				hash_unlock(&primary_hash, request->key);
 				log_write("Key %s not found\n", key_to_str(request->key));
 				response->status = KEY_NOT_FOUND;
 				break;
 			}
+			hash_unlock(&primary_hash, request->key);
 
 			// Copy the stored value into the response buffer
 			memcpy(response->value, data, size);
@@ -273,6 +334,11 @@ static void process_client_message(int fd)
 		}
 
 		case OP_PUT: {
+			// TODO: forward the PUT request to the secondary replica
+			if(replicate_put(request) == false) {
+				response->status = SERVER_FAILURE;
+				break;
+			}
 			// Need to copy the value to dynamically allocated memory
 			size_t value_size = request->hdr.length - sizeof(*request);
 			void *value_copy = malloc(value_size);
@@ -288,22 +354,24 @@ static void process_client_message(int fd)
 			size_t old_value_sz = 0;
 
 			// Put the <key, value> pair into the hash table
+			// acquire lock
+			hash_lock(&primary_hash, request->key);
 			if (!hash_put(&primary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
 			{
+				hash_unlock(&primary_hash, request->key);
 				log_error("sid %d: Out of memory\n", server_id);
 				free(value_copy);
 				response->status = OUT_OF_SPACE;
 				break;
 			}
+			hash_unlock(&primary_hash, request->key);
 
-			// TODO: forward the PUT request to the secondary replica
-			// ...
-
+			
 			// Need to free the old value (if there was any)
 			if (old_value != NULL) {
 				free(old_value);
 			}
-
+			
 			response->status = SUCCESS;
 			break;
 		}
@@ -322,23 +390,78 @@ static void process_client_message(int fd)
 // (in both cases the connection will be closed)
 static bool process_server_message(int fd)
 {
-	log_write("%s Receiving a server message\n", current_time_str());
+	log_write("%s Receiving a server message, fd is %d\n", current_time_str(), fd);
 
 	// Read and parse the message
+	///TODO This should be further modified to handle failure/recovery messages, currently handling just replication
 	char req_buffer[MAX_MSG_LEN] = {0};
-	if (!recv_msg(fd, req_buffer, MAX_MSG_LEN, MSG_OPERATION_REQ)) {
+	if (!recv_msg(fd, req_buffer, MAX_MSG_LEN, -1)) {
+		log_write("Req buffer is %s\n", req_buffer);
+		log_write("Failed to recv in process server message, closing connection\n");
 		return false;
 	}
 	operation_request *request = (operation_request*)req_buffer;
 
+	// Initialize the response
+	char resp_buffer[MAX_MSG_LEN] = {0};
+	operation_response *response = (operation_response*)resp_buffer;
+	response->hdr.type = MSG_OPERATION_RESP;
+	uint16_t value_sz = 0;
+
 	// NOOP operation request is used to indicate the last message in an UPDATE sequence
-	if (request->type == OP_NOOP) {
-		log_write("Received the last server message, closing connection\n");
-		return false;
+	switch(request->type) {
+		case OP_NOOP: {
+			log_write("Received the last server message, closing connection\n");
+			return false;
+		}
+		case OP_PUT: {
+			// Need to copy the value to dynamically allocated memory
+			size_t value_size = request->hdr.length - sizeof(*request);
+			void *value_copy = malloc(value_size);
+			if (value_copy == NULL) {
+				log_perror("malloc");
+				log_error("sid %d: Out of memory\n", server_id);
+				response->status = OUT_OF_SPACE;
+				break;
+			}
+			memcpy(value_copy, request->value, value_size);
+
+			void *old_value = NULL;
+			size_t old_value_sz = 0;
+
+			// Put the <key, value> pair into the hash table
+			// acquire lock
+			log_write("Sid %d Inserting in secondary\n", server_id);
+			hash_lock(&secondary_hash, request->key);
+			if (!hash_put(&secondary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
+			{
+				hash_unlock(&secondary_hash, request->key);
+				log_error("sid %d: Out of memory\n", server_id);
+				free(value_copy);
+				response->status = OUT_OF_SPACE;
+				break;
+			}
+			hash_unlock(&secondary_hash, request->key);
+
+
+			// Need to free the old value (if there was any)
+			if (old_value != NULL) {
+				free(old_value);
+			}
+
+			response->status = SUCCESS;
+			break;
+		}
+		default:
+			log_error("sid %d: Invalid server operation type\n", server_id);
+			return false;
+
 	}
 
 	// TODO: process the message and send the response
 	// ...
+	// Send reply to the server
+	send_msg(fd, response, sizeof(*response) + value_sz);
 
 	return true;
 }
@@ -368,9 +491,13 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 		case SET_SECONDARY:
 			response.status = ((secondary_fd = connect_to_server(request->host_name, request->port)) < 0)
 			                ? CTRLREQ_FAILURE : CTRLREQ_SUCCESS;
+			log_write("Secondary fd is %d\n", secondary_fd);
+			//response.status = CTRLREQ_SUCCESS;
 			break;
 
 		case SHUTDOWN:
+			//kill heartbeat thread
+
 			*shutdown_requested = true;
 			return true;
 
@@ -386,17 +513,72 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 	return true;
 }
 
+void run_s_loop() {
+	// Usual preparation stuff for select()
+	fd_set rset, allset;
+	FD_ZERO(&allset);
+	FD_SET(my_servers_fd, &allset);//to process connections from servers
+	int maxfd = my_servers_fd;
 
+	for(;;) {
+		rset = allset;
+
+		int num_ready_fds = select(maxfd + 1, &rset, NULL, NULL, NULL);
+		if (num_ready_fds < 0) {
+			log_perror("select");
+			return;
+		}
+
+		if (num_ready_fds <= 0) {
+			continue;
+		}
+
+		if(shutdown_flag == true) {
+			return;
+		}
+		// Incoming connection from a server
+		if (FD_ISSET(my_servers_fd, &rset)) {
+			int fd_idx = accept_connection(my_servers_fd, server_fd_table, MAX_SERVER_SESSIONS);
+			log_write("Accepted server connection, fd index is %d fd is %d\n", fd_idx, server_fd_table[fd_idx]);
+			if (fd_idx >= 0) {
+				FD_SET(server_fd_table[fd_idx], &allset);
+				maxfd = max(maxfd, server_fd_table[fd_idx]);
+			}
+
+			if (--num_ready_fds <= 0) {
+				continue;
+			}
+		}
+
+		// Check for any messages from connected servers
+		for (int i = 0; i < MAX_SERVER_SESSIONS; i++) {
+			if ((server_fd_table[i] != -1) && FD_ISSET(server_fd_table[i], &rset)) {
+				if(process_server_message(server_fd_table[i]) == false) {
+					log_write("sid %d: Closing server connection\n", server_id);
+					FD_CLR(server_fd_table[i], &allset);
+					close_safe(&(server_fd_table[i]));
+				}
+				if (--num_ready_fds <= 0) {
+					break;
+				}
+			}
+		}
+
+
+	}
+}
 // Returns false if stopped due to errors, true if shutdown was requested
-static bool run_server_loop()
+static bool run_mc_loop()
 {
 	// Usual preparation stuff for select()
 	fd_set rset, allset;
 	FD_ZERO(&allset);
 	FD_SET(my_clients_fd, &allset);
 	FD_SET(my_mservers_fd, &allset);
+	//FD_SET(my_servers_fd, &allset);//to process connections from servers
 
 	int maxfd = max(my_clients_fd, my_mservers_fd);
+	//maxfd = max(maxfd, my_servers_fd);
 
 	// Server sits in an infinite loop waiting for incoming connections from mserver/clients
 	// and for incoming messages from already connected mserver/clients
@@ -420,6 +602,7 @@ static bool run_server_loop()
 		// Incoming connection from the metadata server
 		if (FD_ISSET(my_mservers_fd, &rset)) {
 			int fd_idx = accept_connection(my_mservers_fd, &mserver_fd_in, 1);
+			log_write("Accepted metadata server connection, fd is %d\n", mserver_fd_in);
 			if (fd_idx >= 0) {
 				FD_SET(mserver_fd_in, &allset);
 				maxfd = max(maxfd, mserver_fd_in);
@@ -440,6 +623,7 @@ static bool run_server_loop()
 				FD_CLR(mserver_fd_in, &allset);
 				close_safe(&(mserver_fd_in));
 			} else if (shutdown_requested) {
+				shutdown_flag = true;
 				return true;
 			}
 
@@ -447,6 +631,34 @@ static bool run_server_loop()
 				continue;
 			}
 		}
+
+		/*// Incoming connection from a server
+		if (FD_ISSET(my_servers_fd, &rset)) {
+			int fd_idx = accept_connection(my_servers_fd, server_fd_table, MAX_SERVER_SESSIONS);
+			log_write("Accepted server connection, fd index is %d fd is %d\n", fd_idx, server_fd_table[fd_idx]);
+			if (fd_idx >= 0) {
+				FD_SET(server_fd_table[fd_idx], &allset);
+				maxfd = max(maxfd, server_fd_table[fd_idx]);
+			}
+
+			if (--num_ready_fds <= 0) {
+				continue;
+			}
+		}
+
+		// Check for any messages from connected servers
+		for (int i = 0; i < MAX_SERVER_SESSIONS; i++) {
+			if ((server_fd_table[i] != -1) && FD_ISSET(server_fd_table[i], &rset)) {
+				if(process_server_message(server_fd_table[i]) == false) {
+					log_write("sid %d: Closing server connection\n", server_id);
+					FD_CLR(server_fd_table[i], &allset);
+					close_safe(&(server_fd_table[i]));
+				}
+				if (--num_ready_fds <= 0) {
+					break;
+				}
+			}
+		}*/
 
 		// Incoming connection from a client
 		if (FD_ISSET(my_clients_fd, &rset)) {
@@ -477,7 +689,14 @@ static bool run_server_loop()
 	}
 }
 
-
+void *run_mc() {
+	bool result = run_mc_loop();
+	return (void *)result;
+}
+void *run_s() {
+	run_s_loop();
+	return NULL;
+}
 int main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
@@ -493,7 +712,15 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	bool result = run_server_loop();
+	pthread_t mc_t, s_t;
+	void *status;
+	pthread_create(&mc_t, NULL, run_mc, NULL);
+	pthread_create(&s_t, NULL, run_s, NULL);
+	pthread_join(mc_t, &status);
+	pthread_join(s_t, NULL);
+	pthread_join(hb_t, NULL);
+	bool result = (bool)status;
+	//bool result = run_server_loop();
 
 	cleanup();
 	return result ? 0 : 1;
