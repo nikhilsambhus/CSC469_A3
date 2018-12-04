@@ -1,0 +1,11 @@
+client
+mserver
+server
+*.o
+*.d
+*~
+*.log
+util/*.o
+util/*.d
+util/collections/*.o
+util/collections/*.d
