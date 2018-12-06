@@ -386,7 +386,6 @@ static bool process_server_message(int fd)
 	log_write("%s Receiving a server message, fd is %d\n", current_time_str(), fd);
 
 	// Read and parse the message
-	///TODO This should be further modified to handle failure/recovery messages, currently handling just replication
 	char req_buffer[MAX_MSG_LEN] = {0};
 	if (!recv_msg(fd, req_buffer, MAX_MSG_LEN, -1)) {
 		log_write("Req buffer is %s\n", req_buffer);
@@ -422,19 +421,35 @@ static bool process_server_message(int fd)
 			void *old_value = NULL;
 			size_t old_value_sz = 0;
 
-			// Put the <key, value> pair into the hash table
-			// acquire lock
-			log_write("sid %d: is secondary, replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
-			hash_lock(&secondary_hash, request->key);
-			if (!hash_put(&secondary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
-			{
+
+			int key_srv_id = key_server_id(request->key, num_servers);
+			if (key_srv_id == server_id) {
+				// is in recovery, this is of primary table
+				log_write("sid %d: recovery: received primary, key %s, value %s\n", server_id, key_to_str(request->key), request->value);
+				hash_lock(&primary_hash, request->key);
+				if (!hash_put(&primary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
+				{
+					hash_unlock(&primary_hash, request->key);
+					log_error("sid %d: Out of memory\n", server_id);
+					free(value_copy);
+					response->status = OUT_OF_SPACE;
+					break;
+				}
+				hash_unlock(&primary_hash, request->key);
+			} 
+			else {
+				log_write("sid %d: is secondary, replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
+				hash_lock(&secondary_hash, request->key);
+				if (!hash_put(&secondary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
+				{
+					hash_unlock(&secondary_hash, request->key);
+					log_error("sid %d: Out of memory\n", server_id);
+					free(value_copy);
+					response->status = OUT_OF_SPACE;
+					break;
+				}
 				hash_unlock(&secondary_hash, request->key);
-				log_error("sid %d: Out of memory\n", server_id);
-				free(value_copy);
-				response->status = OUT_OF_SPACE;
-				break;
 			}
-			hash_unlock(&secondary_hash, request->key);
 
 
 			// Need to free the old value (if there was any)
@@ -461,14 +476,41 @@ static bool process_server_message(int fd)
 	return true;
 }
 
-void primary(const char key[KEY_SIZE], void *value, size_t value_sz, void *arg){
-	log_write("111\n");
+void update_primary_iterator(const char key[KEY_SIZE], void *value, size_t value_sz, void *arg)
+{
+	assert(key != NULL);
+	assert(value != NULL);
+
+	log_write("sid %d: recovery: getting lock, key %s, value %s\n", server_id, key_to_str(key), value);
+	//hash_lock(&secondary_hash, key);			
+	log_write("sid %d: recovery: send update primary, key %s, value %s\n", server_id, key_to_str(key), value);
+
+	char send_buffer[MAX_MSG_LEN] = {0};
+	operation_request *request = (operation_request*)send_buffer;
+	request->hdr.type = MSG_OPERATION_REQ;
+	request->type = OP_PUT;
+	memcpy(request->key, key, KEY_SIZE);
+	memcpy(request->value, value, value_sz);
+
+	char recv_buffer[MAX_MSG_LEN] = {0};
+	if (!send_msg(primary_fd, request, sizeof(*request) + value_sz) ||
+	    !recv_msg(primary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP)) {
+		log_write("sid %d: recovery: send update primary failed, %s, value %s\n", server_id, key_to_str(key), value);
+		hash_unlock(&secondary_hash, key);
+		return;
+	}
+	
+	log_write("sid %d: recovery: send update primary success, %s, value %s\n", server_id, key_to_str(key), value);
+	//hash_unlock(&secondary_hash, key);
+	return;
 }
 
 
 // async thread to do recovery: sending hash table to the primary
-void *update_primary() {
-	//hash_iterate(&primary_hash, primary, NULL);
+void *update_primary()
+{
+	log_write("1111");
+	hash_iterate(&secondary_hash, update_primary_iterator, NULL);
 }
 
 
@@ -521,10 +563,10 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 			else {
 				response.status = CTRLREQ_SUCCESS;
 				log_write("Update primary connection %s:%u success, fd is %d\n", request->host_name, request->port, primary_fd);
-				//pthread_create(&async_t, NULL, update_primary, NULL);
-				hash_iterate(&secondary_hash, primary, NULL);
 				
-				// send 
+				// sending 2nd hash table async 
+				pthread_create(&async_t, NULL, update_primary, NULL);
+				
 			}
 			break;
 
