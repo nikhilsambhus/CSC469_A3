@@ -431,7 +431,7 @@ static bool process_server_message(int fd)
 
 			// Put the <key, value> pair into the hash table
 			// acquire lock
-			log_write("Sid %d Inserting in secondary\n", server_id);
+			log_write("sid %d: replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
 			hash_lock(&secondary_hash, request->key);
 			if (!hash_put(&secondary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
 			{
@@ -448,7 +448,11 @@ static bool process_server_message(int fd)
 			if (old_value != NULL) {
 				free(old_value);
 			}
-
+			void *data = NULL;
+			size_t size = 0;
+			hash_get(&secondary_hash, request->key, &data, &size);
+			// to output the real value in the hash table
+			log_write("sid %d: replicate success, key %s, value %s\n", server_id, key_to_str(request->key), data);
 			response->status = SUCCESS;
 			break;
 		}
@@ -489,10 +493,15 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 	// Process the request based on its type
 	switch (request->type) {
 		case SET_SECONDARY:
-			response.status = ((secondary_fd = connect_to_server(request->host_name, request->port)) < 0)
-			                ? CTRLREQ_FAILURE : CTRLREQ_SUCCESS;
-			log_write("Secondary fd is %d\n", secondary_fd);
-			//response.status = CTRLREQ_SUCCESS;
+			secondary_fd = connect_to_server(request->host_name, request->port);
+			if (secondary_fd < 0) {
+				response.status = CTRLREQ_FAILURE;
+				log_write("Set secondary as %s:%u FAILED\n", request->host_name, request->port);
+			}
+			else {
+				response.status = CTRLREQ_SUCCESS;
+				log_write("Set secondary as %s:%u success, fd is %d\n", request->host_name, request->port, secondary_fd);
+			}
 			break;
 
 		case SHUTDOWN:
