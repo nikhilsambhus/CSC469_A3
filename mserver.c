@@ -98,6 +98,10 @@ static int servers_fd = -1;
 static int client_fd_table[MAX_CLIENT_SESSIONS];
 
 
+typedef enum {
+	A,
+} server_status;
+
 // Structure describing a key-value server state
 typedef struct _server_node {
 	// Server host name, possibly prefixed by "user@" (for starting servers remotely via ssh)
@@ -126,7 +130,16 @@ static int num_servers = 0;
 // Server state information
 static server_node *server_nodes = NULL;
 
-static int failed_server_id = -1;
+static struct {
+	// whether there are recovery going on right now
+	bool is_in;
+	// failed server id
+	int failed_sid;
+	// id of the server who is the replica of the failed server; will act as temp primary
+	int primary_sid;
+	// id of the server who replicated at the failed server; will send replica again
+	int secondary_sid;
+} recovery;
 
 // Read the configuration file, fill in the server_nodes array
 // Returns false if the configuration is invalid
@@ -199,6 +212,11 @@ static bool init_mserver()
 		client_fd_table[i] = -1;
 	}
 
+	recovery.is_in = false;
+	recovery.failed_sid = -1;
+	recovery.primary_sid = -1;
+	recovery.secondary_sid = -1;
+
 	// Get the host name that server is running on
 	if (get_local_host_name(mserver_host_name, sizeof(mserver_host_name)) < 0) {
 		return false;
@@ -243,7 +261,7 @@ static void cleanup()
 		for (int i = 0; i < num_servers; i++) {
 			server_node *node = &(server_nodes[i]);
 
-			if (node->socket_fd_out != -1 && failed_server_id != i) {
+			if (node->socket_fd_out != -1 && recovery.failed_sid != i) {
 				// Request server shutdown
 				server_ctrl_request request = {0};
 				request.hdr.type = MSG_SERVER_CTRL_REQ;
@@ -512,25 +530,22 @@ static const int select_timeout_interval = 1;// seconds
 
 static time_t hbeat_timer = 0;
 
+// returns -1 if no failures occured; otherwise returns the failed server id.
+int monitor_heartbeat(void) {
 
-int monitor_heartbeat(int *sid) {
-
-	if(hbeat_timer == 0) { //initialization
-		hbeat_timer = time(NULL);
+	if (hbeat_timer == 0) { 
+		hbeat_timer = time(NULL); // initialization
 	}
-	else if((time(NULL) - hbeat_timer) >= default_server_timeout) {
+	else if ((time(NULL) - hbeat_timer) >= default_server_timeout) {
 		for (int i = 0; i < num_servers; i++) {
-			if(server_nodes[i].latest_alive <= hbeat_timer) {
+			if (server_nodes[i].latest_alive <= hbeat_timer) {
 				hbeat_timer = time(NULL); //reset
-				*sid = i;
-				failed_server_id = i;	
-				log_write("Server %d is dead\n", i);
-				return -1;
+				return i;
 			}
 		}
 		hbeat_timer = time(NULL); //reset
 	}
-	return 0;	
+	return -1;
 }
 
 // Returns false if stopped due to errors, true if shutdown was requested
@@ -563,12 +578,6 @@ static bool run_mserver_loop()
 		time_out.tv_sec = select_timeout_interval;
 		time_out.tv_usec = 0;
 		
-		int sid;
-		if(monitor_heartbeat(&sid) == -1) {
-			log_write("Server failure detected, server id %d\n", sid);
-			log_error("Server failure detected, server id %d\n", sid);
-		}
-		// Wait with timeout (in order to be able to handle asynchronous events such as heartbeat messages)
 		int num_ready_fds = select(maxfd + 1, &rset, NULL, NULL, &time_out);
 		if (num_ready_fds < 0) {
 			log_perror("select");
@@ -609,6 +618,27 @@ static bool run_mserver_loop()
 		// within the timeout interval. Keep information in the server_node structure regarding when was the last
 		// heartbeat received from a server and compare to current time. Initiate recovery if discovered a failure.
 		// ...
+		
+		int failure_detected = monitor_heartbeat();
+		if (failure_detected != -1) {
+			if (!recovery.is_in) {
+				// detected a new failure, start recovery process
+				log_error("New Server failure detected, server id %d\n", failure_detected);
+				recovery.is_in = true;
+				recovery.failed_sid = failure_detected;
+				recovery.primary_sid = 1; //TODO
+				recovery.secondary_sid = 1; //TODO
+				spawn_server(recovery.failed_sid);
+
+			} 
+			else if (recovery.failed_sid != failure_detected) {
+				// multiple failure detected
+				log_error("Fatal: multiple failure detected, new failure server %d, exit gracefully\n", failure_detected);
+				return false;
+			} else {
+				// failure is being handled currently, do nothing 
+			}
+		}
 
 		if (num_ready_fds <= 0) {
 			continue;

@@ -128,30 +128,9 @@ static int secondary_fd = -1;
 static void cleanup();
 
 static const int hash_size = 65536;
-
 static const int heartbeat_interval = 1;
 
-static pthread_t hb_t;
 
-void *send_heartbeat() {
-	mserver_ctrl_request hb_req;
-	hb_req.type = HEARTBEAT;
-	hb_req.server_id = server_id;
-	hb_req.hdr.type = MSG_MSERVER_CTRL_REQ;
-	char req_buffer[sizeof(hb_req)];
-
-	while(1) {
-		sleep(heartbeat_interval);
-		if(shutdown_flag == true) {
-			return NULL;
-		}
-		memcpy(req_buffer, &hb_req, sizeof(hb_req));
-		if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
-			log_write("Error while sending heartbeat to metadata\n");
-		}
-	}	
-
-}
 // Initialize and start the server
 static bool init_server()
 {
@@ -191,10 +170,7 @@ static bool init_server()
 	if (!hash_init(&secondary_hash, hash_size)) {
 		goto cleanup;
 	}
-	// TODO: Create a separate thread that takes care of sending periodic heartbeat messages
-	// ...
 
-	pthread_create(&hb_t, NULL, &send_heartbeat, NULL);
 	log_write("Server initialized\n");
 	return true;
 
@@ -334,7 +310,7 @@ static void process_client_message(int fd)
 		}
 
 		case OP_PUT: {
-			// TODO: forward the PUT request to the secondary replica
+			// forward the PUT request to the secondary replica
 			if(replicate_put(request) == false) {
 				response->status = SERVER_FAILURE;
 				break;
@@ -576,6 +552,7 @@ void run_s_loop() {
 
 	}
 }
+
 // Returns false if stopped due to errors, true if shutdown was requested
 static bool run_mc_loop()
 {
@@ -592,8 +569,6 @@ static bool run_mc_loop()
 	// Server sits in an infinite loop waiting for incoming connections from mserver/clients
 	// and for incoming messages from already connected mserver/clients
 	//
-	// TODO: process connections and messages from other servers as well
-	// ...
 
 	for (;;) {
 		rset = allset;
@@ -641,34 +616,6 @@ static bool run_mc_loop()
 			}
 		}
 
-		/*// Incoming connection from a server
-		if (FD_ISSET(my_servers_fd, &rset)) {
-			int fd_idx = accept_connection(my_servers_fd, server_fd_table, MAX_SERVER_SESSIONS);
-			log_write("Accepted server connection, fd index is %d fd is %d\n", fd_idx, server_fd_table[fd_idx]);
-			if (fd_idx >= 0) {
-				FD_SET(server_fd_table[fd_idx], &allset);
-				maxfd = max(maxfd, server_fd_table[fd_idx]);
-			}
-
-			if (--num_ready_fds <= 0) {
-				continue;
-			}
-		}
-
-		// Check for any messages from connected servers
-		for (int i = 0; i < MAX_SERVER_SESSIONS; i++) {
-			if ((server_fd_table[i] != -1) && FD_ISSET(server_fd_table[i], &rset)) {
-				if(process_server_message(server_fd_table[i]) == false) {
-					log_write("sid %d: Closing server connection\n", server_id);
-					FD_CLR(server_fd_table[i], &allset);
-					close_safe(&(server_fd_table[i]));
-				}
-				if (--num_ready_fds <= 0) {
-					break;
-				}
-			}
-		}*/
-
 		// Incoming connection from a client
 		if (FD_ISSET(my_clients_fd, &rset)) {
 			int fd_idx = accept_connection(my_clients_fd, client_fd_table, MAX_CLIENT_SESSIONS);
@@ -698,14 +645,37 @@ static bool run_mc_loop()
 	}
 }
 
+// Returns false if stopped due to errors, true if shutdown was requested
 void *run_mc() {
 	bool result = run_mc_loop();
 	return (void *)result;
 }
+
 void *run_s() {
 	run_s_loop();
 	return NULL;
 }
+
+void *send_heartbeat() {
+	mserver_ctrl_request hb_req;
+	hb_req.type = HEARTBEAT;
+	hb_req.server_id = server_id;
+	hb_req.hdr.type = MSG_MSERVER_CTRL_REQ;
+	char req_buffer[sizeof(hb_req)];
+
+	while(1) {
+		sleep(heartbeat_interval);
+		if(shutdown_flag == true) {
+			log_write("shutdown_flag is true, shutting down the thread\n");
+			return NULL;
+		}
+		memcpy(req_buffer, &hb_req, sizeof(hb_req));
+		if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
+			log_write("Error while sending heartbeat to metadata\n");
+		}
+	}	
+}
+
 int main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
@@ -721,16 +691,16 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	pthread_t mc_t, s_t;
-	void *status;
+	pthread_t mc_t, s_t, hb_t;
+	void *result;
 	pthread_create(&mc_t, NULL, run_mc, NULL);
 	pthread_create(&s_t, NULL, run_s, NULL);
-	pthread_join(mc_t, &status);
-	pthread_join(s_t, NULL);
-	pthread_join(hb_t, NULL);
-	bool result = (bool)status;
-	//bool result = run_server_loop();
+	pthread_create(&hb_t, NULL, send_heartbeat, NULL);
+	pthread_join(mc_t, &result); // mc: for mserver and client requests
+	pthread_join(s_t, NULL);     // s:  for server requests
+	pthread_join(hb_t, NULL);    // hb: for heartbeat messages
+	bool no_errors = (bool)result;
 
 	cleanup();
-	return result ? 0 : 1;
+	return !no_errors;
 }
