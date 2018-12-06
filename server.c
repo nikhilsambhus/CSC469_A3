@@ -130,6 +130,20 @@ static void cleanup();
 static const int hash_size = 65536;
 static const int heartbeat_interval = 1;
 
+pthread_t async_t;
+
+typedef enum {
+	STATUS_INIT,
+	STATUS_NORMAL,
+
+	STATUS_UPDATE_PRIMARY,
+	STATUS_UPDATED_PRIMARY,
+
+	STATUS_UPDATE_SECONDARY,
+	STATUS_UPDATED_SECONDARY,
+} __attribute__((packed)) server_status_type;
+
+server_status_type server_status = STATUS_INIT;
 
 // Initialize and start the server
 static bool init_server()
@@ -172,6 +186,7 @@ static bool init_server()
 	}
 
 	log_write("Server initialized\n");
+	server_status = STATUS_NORMAL;
 	return true;
 
 cleanup:
@@ -221,12 +236,12 @@ static void cleanup()
 
 }
 
-//Replicate by sending to secondary server and wait for confirmation
+// Replicate by sending to secondary server and wait for confirmation
 static bool replicate_put(operation_request *request) {
-	//return true;
 	size_t value_size = request->hdr.length - sizeof(*request);
 	
-	log_write("Entered replicate \n");
+	log_write("sid %d: is primary, replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
+
 	char *req_buffer = malloc(sizeof(*request) + value_size);
 	if(req_buffer == NULL) {
 		return false;
@@ -237,17 +252,17 @@ static bool replicate_put(operation_request *request) {
 	char recv_buffer[MAX_MSG_LEN] = {0};
 
 	while(secondary_fd == -1);
-        if (!send_msg(secondary_fd, req_buffer, sizeof(*request) + value_size) || !recv_msg(secondary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP))
-        {
-		log_write("Failed replicate\n");
+	if (!send_msg(secondary_fd, req_buffer, sizeof(*request) + value_size) || !recv_msg(secondary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP)) {
+		log_write("sid %d: is primary, replicate failed, %s, value %s\n", server_id, key_to_str(request->key), request->value);
 		free(req_buffer);
-                return false;
+				return false;
 	}
-	log_write("Success replicate\n");
+	
+	log_write("sid %d: is primary, replicate success, %s, value %s\n", server_id, key_to_str(request->key), request->value);
 	free(req_buffer);
 	return true;
-	
 }
+
 // Connection will be closed after calling this function regardless of result
 static void process_client_message(int fd)
 {
@@ -266,13 +281,12 @@ static void process_client_message(int fd)
 	response->hdr.type = MSG_OPERATION_RESP;
 	uint16_t value_sz = 0;
 
-	// TODO: extend this function to support replication
-	// Make sure to implement all necessary synchronization. Feel free to use the lock/unlock functions from hash.h.
-	// ...
 
 	// Check that requested key is valid
 	int key_srv_id = key_server_id(request->key, num_servers);
 	if (key_srv_id != server_id) {
+
+		// TODO check if is this acts as temp primary
 		log_error("sid %d: Invalid client key %s sid %d\n", server_id, key_to_str(request->key), key_srv_id);
 		// This sould be considered a server failure (e.g. the metadata server directed a client to the wrong server)
 		response->status = SERVER_FAILURE;
@@ -311,10 +325,13 @@ static void process_client_message(int fd)
 
 		case OP_PUT: {
 			// forward the PUT request to the secondary replica
+			hash_lock(&primary_hash, request->key);			
 			if(replicate_put(request) == false) {
 				response->status = SERVER_FAILURE;
 				break;
 			}
+			hash_unlock(&primary_hash, request->key);
+
 			// Need to copy the value to dynamically allocated memory
 			size_t value_size = request->hdr.length - sizeof(*request);
 			void *value_copy = malloc(value_size);
@@ -407,7 +424,7 @@ static bool process_server_message(int fd)
 
 			// Put the <key, value> pair into the hash table
 			// acquire lock
-			log_write("sid %d: replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
+			log_write("sid %d: is secondary, replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
 			hash_lock(&secondary_hash, request->key);
 			if (!hash_put(&secondary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
 			{
@@ -428,7 +445,7 @@ static bool process_server_message(int fd)
 			size_t size = 0;
 			hash_get(&secondary_hash, request->key, &data, &size);
 			// to output the real value in the hash table
-			log_write("sid %d: replicate success, key %s, value %s\n", server_id, key_to_str(request->key), data);
+			log_write("sid %d: is secondary, replicate success, key %s, value %s\n", server_id, key_to_str(request->key), data);
 			response->status = SUCCESS;
 			break;
 		}
@@ -438,13 +455,22 @@ static bool process_server_message(int fd)
 
 	}
 
-	// TODO: process the message and send the response
-	// ...
 	// Send reply to the server
 	send_msg(fd, response, sizeof(*response) + value_sz);
 
 	return true;
 }
+
+void primary(const char key[KEY_SIZE], void *value, size_t value_sz, void *arg){
+	log_write("111\n");
+}
+
+
+// async thread to do recovery: sending hash table to the primary
+void *update_primary() {
+	//hash_iterate(&primary_hash, primary, NULL);
+}
+
 
 // Returns false if the message was invalid (so the connection will be closed)
 // Sets *shutdown_requested to true if received a SHUTDOWN message (so the server will terminate)
@@ -486,8 +512,33 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 			*shutdown_requested = true;
 			return true;
 
-		// TODO: handle remaining message types
-		// ...
+		case UPDATE_PRIMARY:
+			primary_fd = connect_to_server(request->host_name, request->port);
+			if (primary_fd < 0) {
+				response.status = CTRLREQ_FAILURE;
+				log_write("Update primary as %s:%u connectiong FAILED\n", request->host_name, request->port);
+			}
+			else {
+				response.status = CTRLREQ_SUCCESS;
+				log_write("Update primary connection %s:%u success, fd is %d\n", request->host_name, request->port, primary_fd);
+				//pthread_create(&async_t, NULL, update_primary, NULL);
+				hash_iterate(&secondary_hash, primary, NULL);
+				
+				// send 
+			}
+			break;
+
+		case UPDATE_SECONDARY:
+			secondary_fd = connect_to_server(request->host_name, request->port);
+			if (secondary_fd < 0) {
+				response.status = CTRLREQ_FAILURE;
+				log_write("Update 2nd as %s:%u FAILED\n", request->host_name, request->port);
+			}
+			else {
+				response.status = CTRLREQ_SUCCESS;
+				log_write("Update 2nd as %s:%u success, fd is %d\n", request->host_name, request->port, secondary_fd);
+			}
+			break;
 
 		default:// impossible
 			assert(false);
@@ -539,7 +590,7 @@ void run_s_loop() {
 		for (int i = 0; i < MAX_SERVER_SESSIONS; i++) {
 			if ((server_fd_table[i] != -1) && FD_ISSET(server_fd_table[i], &rset)) {
 				if(process_server_message(server_fd_table[i]) == false) {
-					log_write("sid %d: Closing server connection\n", server_id);
+					log_write("sid %d: Closing server connection, fd %d, p-fd = %d, s-fd = %d\n", server_id, server_fd_table[i], primary_fd, secondary_fd);
 					FD_CLR(server_fd_table[i], &allset);
 					close_safe(&(server_fd_table[i]));
 				}
@@ -561,7 +612,6 @@ static bool run_mc_loop()
 	FD_ZERO(&allset);
 	FD_SET(my_clients_fd, &allset);
 	FD_SET(my_mservers_fd, &allset);
-	//FD_SET(my_servers_fd, &allset);//to process connections from servers
 
 	int maxfd = max(my_clients_fd, my_mservers_fd);
 	//maxfd = max(maxfd, my_servers_fd);

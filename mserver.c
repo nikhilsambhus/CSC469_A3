@@ -48,7 +48,7 @@ static uint16_t servers_port = 0;
 static char cfg_file_name[PATH_MAX] = "";
 
 // Timeout for detecting server failures; you might want to adjust this default value
-static const int default_server_timeout = 5;
+static const int default_server_timeout = 2;
 static int server_timeout = 0;
 
 // Log file name
@@ -135,9 +135,9 @@ static struct {
 	bool is_in;
 	// failed server id
 	int failed_sid;
-	// id of the server who is the replica of the failed server; will act as temp primary
+	// who is the primary of the failed server; will send replica again
 	int primary_sid;
-	// id of the server who replicated at the failed server; will send replica again
+	// who is the secondary of the failed server; will send primary and act as temp primary
 	int secondary_sid;
 } recovery;
 
@@ -441,6 +441,75 @@ static bool send_set_secondary(int sid)
 	return true;
 }
 
+// Send the initial UPDATE_PRIMARY message to the secondary of the failed server; returns true on success
+static bool send_update_primary(int sid)
+{
+	char buffer[MAX_MSG_LEN] = {0};
+	server_ctrl_request *request = (server_ctrl_request*)buffer;
+
+	// Fill in the request parameters
+	request->hdr.type = MSG_SERVER_CTRL_REQ;
+	request->type = UPDATE_PRIMARY;
+	server_node *failed_node = &(server_nodes[recovery.failed_sid]);
+	request->port = failed_node->sport;
+
+	// Extract the host name from "user@host"
+	char *at = strchr(failed_node->host_name, '@');
+	char *host = (at == NULL) ? failed_node->host_name : (at + 1);
+
+	int host_name_len = strlen(host) + 1;
+	strncpy(request->host_name, host, host_name_len);
+
+	// Send the request and receive the response
+	server_ctrl_response response = {0};
+	if (!send_msg(server_nodes[sid].socket_fd_out, request, sizeof(*request) + host_name_len) ||
+	    !recv_msg(server_nodes[sid].socket_fd_out, &response, sizeof(response), MSG_SERVER_CTRL_RESP))
+	{
+		return false;
+	}
+
+	if (response.status != CTRLREQ_SUCCESS) {
+		log_error("Server %d failed UPDATE_PRIMARY\n", sid);
+		return false;
+	}
+	return true;
+}
+
+// Send the initial UPDATE_SECONDARY message to the primary of the failed server; returns true on success
+static bool send_update_secondary(int sid)
+{
+	char buffer[MAX_MSG_LEN] = {0};
+	server_ctrl_request *request = (server_ctrl_request*)buffer;
+
+	// Fill in the request parameters
+	request->hdr.type = MSG_SERVER_CTRL_REQ;
+	request->type = UPDATE_SECONDARY;
+	server_node *failed_node = &(server_nodes[recovery.failed_sid]);
+	request->port = failed_node->sport;
+
+	// Extract the host name from "user@host"
+	char *at = strchr(failed_node->host_name, '@');
+	char *host = (at == NULL) ? failed_node->host_name : (at + 1);
+
+	int host_name_len = strlen(host) + 1;
+	strncpy(request->host_name, host, host_name_len);
+
+	// Send the request and receive the response
+	server_ctrl_response response = {0};
+	if (!send_msg(server_nodes[sid].socket_fd_out, request, sizeof(*request) + host_name_len) ||
+	    !recv_msg(server_nodes[sid].socket_fd_out, &response, sizeof(response), MSG_SERVER_CTRL_RESP))
+	{
+		return false;
+	}
+
+	if (response.status != CTRLREQ_SUCCESS) {
+		log_error("Server %d failed UPDATE_PRIMARY\n", sid);
+		return false;
+	}
+	return true;
+}
+
+
 // Start all key-value servers
 static bool init_servers()
 {
@@ -623,12 +692,26 @@ static bool run_mserver_loop()
 		if (failure_detected != -1) {
 			if (!recovery.is_in) {
 				// detected a new failure, start recovery process
-				log_error("New Server failure detected, server id %d\n", failure_detected);
 				recovery.is_in = true;
 				recovery.failed_sid = failure_detected;
-				recovery.primary_sid = 1; //TODO
-				recovery.secondary_sid = 1; //TODO
-				spawn_server(recovery.failed_sid);
+				recovery.primary_sid = primary_server_id(failure_detected, num_servers);
+				recovery.secondary_sid = secondary_server_id(failure_detected, num_servers);
+				log_error("New Server failure detected, server id %d, its primary %d, its secondary %d\n", 
+				failure_detected, recovery.primary_sid, recovery.secondary_sid);
+				
+				if (spawn_server(failure_detected) >= 0) {
+					// respawn server success, start select() on its fd
+					server_node *node = &(server_nodes[failure_detected]);
+					FD_SET(node->socket_fd_in, &allset);
+
+					// you want to send the UPDATE_PRIMARY to the secondary of the failed server, vice versa
+					send_update_primary(recovery.secondary_sid);
+					send_update_secondary(recovery.primary_sid);
+
+				} else {
+					log_error("Fatal: respawn failed server %d failed, exit gracefully\n", recovery.failed_sid);
+					return false;
+				}
 
 			} 
 			else if (recovery.failed_sid != failure_detected) {
