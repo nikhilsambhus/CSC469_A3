@@ -219,6 +219,9 @@ static bool init_mserver()
 	recovery.failed_sid = -1;
 	recovery.primary_sid = -1;
 	recovery.secondary_sid = -1;
+	recovery.updated_primary = false;
+	recovery.updated_secondary = false;
+	recovery.stop_write = false;
 
 	// Get the host name that server is running on
 	if (get_local_host_name(mserver_host_name, sizeof(mserver_host_name)) < 0) {
@@ -515,7 +518,6 @@ static bool send_update_secondary(int sid)
 // Send the initial SWITCH_PRIMARY message to the primary of the failed server; returns true on success
 static bool send_switch_primary(int sid)
 {
-	// TODO stop the write
 	char buffer[MAX_MSG_LEN] = {0};
 	server_ctrl_request *request = (server_ctrl_request*)buffer;
 
@@ -536,6 +538,14 @@ static bool send_switch_primary(int sid)
 		return false;
 	}
 	// TODO switch back the primary
+	
+	recovery.is_in = false;
+	recovery.failed_sid = -1;
+	recovery.primary_sid = -1;
+	recovery.secondary_sid = -1;
+	recovery.updated_primary = false;
+	recovery.updated_secondary = false;
+	recovery.stop_write = false;
 	return true;
 }
 
@@ -576,7 +586,7 @@ static void process_client_message(int fd)
 	int server_id = key_server_id(request.key, num_servers);
 
 	// TODO: redirect client requests to the secondary replica while the primary is being recovered
-	if (recovery.failed_sid == server_id) {
+	if (recovery.is_in && recovery.failed_sid == server_id) {
 		if (recovery.stop_write) {
 			// write stopped, dropped connection (TODO)
 			return;
@@ -622,7 +632,6 @@ static bool process_server_message(int fd)
 		case HEARTBEAT:
 			server_nodes[request->server_id].latest_alive = time(NULL);
 			return true;
-			break;
 		case UPDATED_PRIMARY:
 			log_write("received UPDATED_PRIMARY\n");
 			recovery.updated_primary = true;
@@ -630,7 +639,7 @@ static bool process_server_message(int fd)
 				recovery.stop_write = true;
 				send_switch_primary(recovery.secondary_sid);
 			}
-			break;
+			return true;
 		case UPDATED_SECONDARY:
 			log_write("received UPDATED_SECONDARY\n");
 			recovery.updated_secondary = true;
@@ -638,9 +647,9 @@ static bool process_server_message(int fd)
 				recovery.stop_write = true;
 				send_switch_primary(recovery.secondary_sid);
 			}
-			break;
-		//case UPDATE_PRIMARY_FAILED:
-		//case UPDATE_SECONDARY_FAILED:
+			return true;
+		case UPDATE_PRIMARY_FAILED:
+		case UPDATE_SECONDARY_FAILED:
 		default:
 			log_write("Server message Invalid command\n");
 	}

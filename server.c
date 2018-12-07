@@ -58,7 +58,6 @@ static int num_servers = 0;
 static char log_file_name[PATH_MAX] = "";
 
 static bool shutdown_flag = false;
-static bool updated_sent = false;
 
 static void usage(char **argv)
 {
@@ -142,6 +141,8 @@ typedef enum {
 
 	STATUS_UPDATE_SECONDARY,
 	STATUS_UPDATED_SECONDARY,
+
+	STATUS_STOP_WRITE
 } __attribute__((packed)) server_status_type;
 
 server_status_type server_status = STATUS_INIT;
@@ -238,7 +239,7 @@ static void cleanup()
 }
 
 // Replicate by sending to secondary server and wait for confirmation
-static bool replicate_put(operation_request *request) {
+static bool replicate_put(operation_request *request, int fd) {
 	size_t value_size = request->hdr.length - sizeof(*request);
 	
 	log_write("sid %d: is primary, replicating key %s, value %s\n", server_id, key_to_str(request->key), request->value);
@@ -252,8 +253,8 @@ static bool replicate_put(operation_request *request) {
 	}
 	char recv_buffer[MAX_MSG_LEN] = {0};
 
-	while(secondary_fd == -1);
-	if (!send_msg(secondary_fd, req_buffer, sizeof(*request) + value_size) || !recv_msg(secondary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP)) {
+	while(fd == -1);
+	if (!send_msg(fd, req_buffer, sizeof(*request) + value_size) || !recv_msg(fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP)) {
 		log_write("sid %d: is primary, replicate failed, %s, value %s\n", server_id, key_to_str(request->key), request->value);
 		free(req_buffer);
 				return false;
@@ -289,12 +290,94 @@ static void process_client_message(int fd)
 
 		// TODO check if is this acts as temp primary.
 		// if so, then accept get and set
-		// also, cannot use replicat_put! because it s ends to 2nd_fd
+		// also, cannot use replicat_put! because it sends to 2nd_fd
 		
 		// if in recovery mode, and is acting as temperary primary,
 		// then accept connection
-		if (server_status != STATUS_NORMAL && key_srv_id == primary_sid) {
+		if (server_status > STATUS_NORMAL && server_status < STATUS_STOP_WRITE && key_srv_id == primary_sid) {
+		// copy of the code to handle request
+			log_write("relayed request\n");
+			switch (request->type) {
+				case OP_NOOP:
+					response->status = SUCCESS;
+					break;
 
+				case OP_GET: {
+					void *data = NULL;
+					size_t size = 0;
+
+					// Get the value for requested key from the hash table
+					// acquire lock
+					hash_lock(&secondary_hash, request->key);
+					if (!hash_get(&secondary_hash, request->key, &data, &size)) {
+						hash_unlock(&secondary_hash, request->key);
+						log_write("Key %s not found\n", key_to_str(request->key));
+						response->status = KEY_NOT_FOUND;
+						break;
+					}
+					hash_unlock(&primary_hash, request->key);
+
+					// Copy the stored value into the response buffer
+					memcpy(response->value, data, size);
+					value_sz = size;
+
+					response->status = SUCCESS;
+					break;
+				}
+
+				case OP_PUT: {
+					// forward the PUT request to the secondary replica
+					// the replication during recovery of temp primary is handled up at key_srv_id
+					hash_lock(&secondary_hash, request->key);			
+					if(replicate_put(request, primary_fd) == false) {
+						response->status = SERVER_FAILURE;
+						break;
+					}
+					hash_unlock(&secondary_hash, request->key);
+
+					// Need to copy the value to dynamically allocated memory
+					size_t value_size = request->hdr.length - sizeof(*request);
+					void *value_copy = malloc(value_size);
+					if (value_copy == NULL) {
+						log_perror("malloc");
+						log_error("sid %d: Out of memory\n", server_id);
+						response->status = OUT_OF_SPACE;
+						break;
+					}
+					memcpy(value_copy, request->value, value_size);
+
+					void *old_value = NULL;
+					size_t old_value_sz = 0;
+
+					// Put the <key, value> pair into the hash table
+					// acquire lock
+					hash_lock(&secondary_hash, request->key);
+					if (!hash_put(&secondary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
+					{
+						hash_unlock(&secondary_hash, request->key);
+						log_error("sid %d: Out of memory\n", server_id);
+						free(value_copy);
+						response->status = OUT_OF_SPACE;
+						break;
+					}
+					hash_unlock(&secondary_hash, request->key);
+
+					
+					// Need to free the old value (if there was any)
+					if (old_value != NULL) {
+						free(old_value);
+					}
+					
+					response->status = SUCCESS;
+					break;
+				}
+
+				default:
+					log_error("sid %d: Invalid client operation type\n", server_id);
+					return;
+			}
+			send_msg(fd, response, sizeof(*response) + value_sz);
+			return;
 		}
 
 
@@ -306,6 +389,7 @@ static void process_client_message(int fd)
 		return;
 	}
 
+	log_write("normal request");
 	// Process the request based on its type
 	switch (request->type) {
 		case OP_NOOP:
@@ -339,7 +423,7 @@ static void process_client_message(int fd)
 			// forward the PUT request to the secondary replica
 			// the replication during recovery of temp primary is handled up at key_srv_id
 			hash_lock(&primary_hash, request->key);			
-			if(replicate_put(request) == false) {
+			if(replicate_put(request, secondary_fd) == false) {
 				response->status = SERVER_FAILURE;
 				break;
 			}
@@ -530,9 +614,9 @@ void *update_primary()
 	char req_buffer[sizeof(hb_req)];
 
 	memcpy(req_buffer, &hb_req, sizeof(hb_req));
-	// if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
-	// 	log_write("Error while sending STATUS_UPDATED_PRIMARY to metadata\n");
-	// }
+	if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
+		log_write("Error while sending STATUS_UPDATED_PRIMARY to metadata\n");
+	}
 	
 	
 	return NULL;
@@ -576,9 +660,9 @@ void *update_secondary()
 	hb_req.type = UPDATED_SECONDARY;
 	hb_req.server_id = server_id;
 	hb_req.hdr.type = MSG_MSERVER_CTRL_REQ;
-	// if(!send_msg(mserver_fd_out, (void*)&hb_req, sizeof(hb_req))) {
-	// 	log_write("Error while sending STATUS_UPDATED_SECONDARY to metadata\n");
-	// }
+	if(!send_msg(mserver_fd_out, (void*)&hb_req, sizeof(hb_req))) {
+		log_write("Error while sending STATUS_UPDATED_SECONDARY to metadata\n");
+	}
 
 	return NULL;
 }
@@ -657,7 +741,7 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 		case SWITCH_PRIMARY:
 			// TODO flush PUT, and reply 'it has catches on'
 			response.status = CTRLREQ_SUCCESS;
-
+			server_status = STATUS_NORMAL;
 			break;
 
 		default:// impossible
@@ -841,6 +925,10 @@ void *send_heartbeat() {
 			log_write("shutdown_flag is true, shutting down the thread\n");
 			return NULL;
 		}
+
+
+
+
 		memcpy(req_buffer, &hb_req, sizeof(hb_req));
 		if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
 			log_write("Error while sending heartbeat to metadata\n");
