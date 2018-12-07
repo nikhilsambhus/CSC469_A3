@@ -139,6 +139,9 @@ static struct {
 	int primary_sid;
 	// who is the secondary of the failed server; will send primary and act as temp primary
 	int secondary_sid;
+	bool updated_primary;
+	bool updated_secondary;
+	bool stop_write;
 } recovery;
 
 // Read the configuration file, fill in the server_nodes array
@@ -509,6 +512,33 @@ static bool send_update_secondary(int sid)
 	return true;
 }
 
+// Send the initial SWITCH_PRIMARY message to the primary of the failed server; returns true on success
+static bool send_switch_primary(int sid)
+{
+	// TODO stop the write
+	char buffer[MAX_MSG_LEN] = {0};
+	server_ctrl_request *request = (server_ctrl_request*)buffer;
+
+	// Fill in the request parameters
+	request->hdr.type = MSG_SERVER_CTRL_REQ;
+	request->type = SWITCH_PRIMARY;
+
+	// Send the request and receive the response
+	server_ctrl_response response = {0};
+	if (!send_msg(server_nodes[sid].socket_fd_out, request, sizeof(*request)) ||
+	    !recv_msg(server_nodes[sid].socket_fd_out, &response, sizeof(response), MSG_SERVER_CTRL_RESP))
+	{
+		return false;
+	}
+
+	if (response.status != CTRLREQ_SUCCESS) {
+		log_error("Server %d failed SWITCH_PRIMARY\n", sid);
+		return false;
+	}
+	// TODO switch back the primary
+	return true;
+}
+
 
 // Start all key-value servers
 static bool init_servers()
@@ -546,7 +576,15 @@ static void process_client_message(int fd)
 	int server_id = key_server_id(request.key, num_servers);
 
 	// TODO: redirect client requests to the secondary replica while the primary is being recovered
-	// ...
+	if (recovery.failed_sid == server_id) {
+		if (recovery.stop_write) {
+			// write stopped, dropped connection (TODO)
+			return;
+		} else {
+			server_id = recovery.secondary_sid;
+		}
+	}
+
 
 	// Fill in the response with the key-value server location information
 	char buffer[MAX_MSG_LEN] = {0};
@@ -571,8 +609,6 @@ static bool process_server_message(int fd)
 {
 	log_write("%s Receiving a server message\n", current_time_str());
 
-	// TODO: read and process the message
-	// ...
 	char req_buffer[MAX_MSG_LEN] = {0};
 
 	if(!recv_msg(fd, req_buffer, MAX_MSG_LEN, MSG_MSERVER_CTRL_REQ)) {
@@ -587,6 +623,24 @@ static bool process_server_message(int fd)
 			server_nodes[request->server_id].latest_alive = time(NULL);
 			return true;
 			break;
+		case UPDATED_PRIMARY:
+			log_write("received UPDATED_PRIMARY\n");
+			recovery.updated_primary = true;
+			if (recovery.updated_secondary) {
+				recovery.stop_write = true;
+				send_switch_primary(recovery.secondary_sid);
+			}
+			break;
+		case UPDATED_SECONDARY:
+			log_write("received UPDATED_SECONDARY\n");
+			recovery.updated_secondary = true;
+			if (recovery.updated_primary) {
+				recovery.stop_write = true;
+				send_switch_primary(recovery.secondary_sid);
+			}
+			break;
+		//case UPDATE_PRIMARY_FAILED:
+		//case UPDATE_SECONDARY_FAILED:
 		default:
 			log_write("Server message Invalid command\n");
 	}
@@ -682,20 +736,19 @@ static bool run_mserver_loop()
 			}
 		}
 
-		// TODO: implement failure detection and recovery
-		// Need to go through the list of servers and figure out which servers have not sent a heartbeat message yet
-		// within the timeout interval. Keep information in the server_node structure regarding when was the last
-		// heartbeat received from a server and compare to current time. Initiate recovery if discovered a failure.
-		// ...
-		
+		// failure detection and recovery
 		int failure_detected = monitor_heartbeat();
 		if (failure_detected != -1) {
 			if (!recovery.is_in) {
 				// detected a new failure, start recovery process
 				recovery.is_in = true;
+				recovery.updated_primary = false;
+				recovery.updated_secondary = false;
+				recovery.stop_write = false;
 				recovery.failed_sid = failure_detected;
 				recovery.primary_sid = primary_server_id(failure_detected, num_servers);
 				recovery.secondary_sid = secondary_server_id(failure_detected, num_servers);
+
 				log_error("New Server failure detected, server id %d, its primary %d, its secondary %d\n", 
 				failure_detected, recovery.primary_sid, recovery.secondary_sid);
 				
@@ -717,7 +770,7 @@ static bool run_mserver_loop()
 			else if (recovery.failed_sid != failure_detected) {
 				// multiple failure detected
 				log_error("Fatal: multiple failure detected, new failure server %d, exit gracefully\n", failure_detected);
-				return false;
+				//return false;
 			} else {
 				// failure is being handled currently, do nothing 
 			}

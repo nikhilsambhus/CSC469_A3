@@ -58,6 +58,7 @@ static int num_servers = 0;
 static char log_file_name[PATH_MAX] = "";
 
 static bool shutdown_flag = false;
+static bool updated_sent = false;
 
 static void usage(char **argv)
 {
@@ -286,7 +287,18 @@ static void process_client_message(int fd)
 	int key_srv_id = key_server_id(request->key, num_servers);
 	if (key_srv_id != server_id) {
 
-		// TODO check if is this acts as temp primary
+		// TODO check if is this acts as temp primary.
+		// if so, then accept get and set
+		// also, cannot use replicat_put! because it s ends to 2nd_fd
+		
+		// if in recovery mode, and is acting as temperary primary,
+		// then accept connection
+		if (server_status != STATUS_NORMAL && key_srv_id == primary_sid) {
+
+		}
+
+
+
 		log_error("sid %d: Invalid client key %s sid %d\n", server_id, key_to_str(request->key), key_srv_id);
 		// This sould be considered a server failure (e.g. the metadata server directed a client to the wrong server)
 		response->status = SERVER_FAILURE;
@@ -325,6 +337,7 @@ static void process_client_message(int fd)
 
 		case OP_PUT: {
 			// forward the PUT request to the secondary replica
+			// the replication during recovery of temp primary is handled up at key_srv_id
 			hash_lock(&primary_hash, request->key);			
 			if(replicate_put(request) == false) {
 				response->status = SERVER_FAILURE;
@@ -480,9 +493,8 @@ void update_primary_iterator(const char key[KEY_SIZE], void *value, size_t value
 {
 	assert(key != NULL);
 	assert(value != NULL);
+	(void)arg;
 
-	log_write("sid %d: recovery: getting lock, key %s, value %s\n", server_id, key_to_str(key), value);
-	//hash_lock(&secondary_hash, key);			
 	log_write("sid %d: recovery: send update primary, key %s, value %s\n", server_id, key_to_str(key), value);
 
 	char send_buffer[MAX_MSG_LEN] = {0};
@@ -496,23 +508,80 @@ void update_primary_iterator(const char key[KEY_SIZE], void *value, size_t value
 	if (!send_msg(primary_fd, request, sizeof(*request) + value_sz) ||
 	    !recv_msg(primary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP)) {
 		log_write("sid %d: recovery: send update primary failed, %s, value %s\n", server_id, key_to_str(key), value);
-		hash_unlock(&secondary_hash, key);
 		return;
 	}
 	
 	log_write("sid %d: recovery: send update primary success, %s, value %s\n", server_id, key_to_str(key), value);
-	//hash_unlock(&secondary_hash, key);
 	return;
 }
 
-
-// async thread to do recovery: sending hash table to the primary
+// async thread to do recovery: sending secondary hash table to the primary
 void *update_primary()
-{
-	log_write("1111");
+{	
 	hash_iterate(&secondary_hash, update_primary_iterator, NULL);
+	log_write("sid %d: recovery: send update primary FINSHED\n");
+	server_status = STATUS_UPDATED_PRIMARY;
+	sleep(5);
+
+	mserver_ctrl_request hb_req;
+	hb_req.type = UPDATED_PRIMARY;
+	hb_req.server_id = server_id;
+	hb_req.hdr.type = MSG_MSERVER_CTRL_REQ;
+	char req_buffer[sizeof(hb_req)];
+
+	memcpy(req_buffer, &hb_req, sizeof(hb_req));
+	// if(!send_msg(mserver_fd_out, req_buffer, sizeof(hb_req))) {
+	// 	log_write("Error while sending STATUS_UPDATED_PRIMARY to metadata\n");
+	// }
+	
+	
+	return NULL;
 }
 
+void update_secondary_iterator(const char key[KEY_SIZE], void *value, size_t value_sz, void *arg)
+{
+	assert(key != NULL);
+	assert(value != NULL);
+	(void)arg;
+
+	log_write("sid %d: recovery: getting lock, key %s, value %s\n", server_id, key_to_str(key), value);
+	log_write("sid %d: recovery: send update secondary, key %s, value %s\n", server_id, key_to_str(key), value);
+
+	char send_buffer[MAX_MSG_LEN] = {0};
+	operation_request *request = (operation_request*)send_buffer;
+	request->hdr.type = MSG_OPERATION_REQ;
+	request->type = OP_PUT;
+	memcpy(request->key, key, KEY_SIZE);
+	memcpy(request->value, value, value_sz);
+
+	char recv_buffer[MAX_MSG_LEN] = {0};
+	if (!send_msg(secondary_fd, request, sizeof(*request) + value_sz) ||
+	    !recv_msg(secondary_fd, recv_buffer, sizeof(recv_buffer), MSG_OPERATION_RESP)) {
+		log_write("sid %d: recovery: send update secondary failed, %s, value %s\n", server_id, key_to_str(key), value);
+		return;
+	}
+	
+	log_write("sid %d: recovery: send update prsecondaryimary success, %s, value %s\n", server_id, key_to_str(key), value);
+	return;
+}
+
+// async thread to do recovery: sending primary hash table to the secondary
+void *update_secondary()
+{
+	hash_iterate(&primary_hash, update_secondary_iterator, NULL);
+	log_write("sid %d: recovery: send update secondary FINSHED\n");
+	server_status = STATUS_UPDATED_SECONDARY;
+
+	mserver_ctrl_request hb_req;
+	hb_req.type = UPDATED_SECONDARY;
+	hb_req.server_id = server_id;
+	hb_req.hdr.type = MSG_MSERVER_CTRL_REQ;
+	// if(!send_msg(mserver_fd_out, (void*)&hb_req, sizeof(hb_req))) {
+	// 	log_write("Error while sending STATUS_UPDATED_SECONDARY to metadata\n");
+	// }
+
+	return NULL;
+}
 
 // Returns false if the message was invalid (so the connection will be closed)
 // Sets *shutdown_requested to true if received a SHUTDOWN message (so the server will terminate)
@@ -550,7 +619,6 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 
 		case SHUTDOWN:
 			//kill heartbeat thread
-
 			*shutdown_requested = true;
 			return true;
 
@@ -565,8 +633,8 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 				log_write("Update primary connection %s:%u success, fd is %d\n", request->host_name, request->port, primary_fd);
 				
 				// sending 2nd hash table async 
+				server_status = STATUS_UPDATE_PRIMARY;
 				pthread_create(&async_t, NULL, update_primary, NULL);
-				
 			}
 			break;
 
@@ -578,8 +646,18 @@ static bool process_mserver_message(int fd, bool *shutdown_requested)
 			}
 			else {
 				response.status = CTRLREQ_SUCCESS;
-				log_write("Update 2nd as %s:%u success, fd is %d\n", request->host_name, request->port, secondary_fd);
+				log_write("Update 2nd as connection %s:%u success, fd is %d\n", request->host_name, request->port, secondary_fd);
+
+				// sending pri hash table asynchronously
+				server_status = STATUS_UPDATE_SECONDARY;
+				pthread_create(&async_t, NULL, update_secondary, NULL);
 			}
+			break;
+
+		case SWITCH_PRIMARY:
+			// TODO flush PUT, and reply 'it has catches on'
+			response.status = CTRLREQ_SUCCESS;
+
 			break;
 
 		default:// impossible
@@ -707,6 +785,8 @@ static bool run_mc_loop()
 				continue;
 			}
 		}
+
+
 
 		// Incoming connection from a client
 		if (FD_ISSET(my_clients_fd, &rset)) {
