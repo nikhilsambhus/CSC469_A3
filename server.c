@@ -296,7 +296,7 @@ static void process_client_message(int fd)
 		// then accept connection
 		if (server_status > STATUS_NORMAL && server_status < STATUS_STOP_WRITE && key_srv_id == primary_sid) {
 		// copy of the code to handle request
-			log_write("relayed request\n");
+			log_write("This request is from a FAILED primary\n");
 			switch (request->type) {
 				case OP_NOOP:
 					response->status = SUCCESS;
@@ -315,7 +315,7 @@ static void process_client_message(int fd)
 						response->status = KEY_NOT_FOUND;
 						break;
 					}
-					hash_unlock(&primary_hash, request->key);
+					hash_unlock(&secondary_hash, request->key);
 
 					// Copy the stored value into the response buffer
 					memcpy(response->value, data, size);
@@ -389,7 +389,7 @@ static void process_client_message(int fd)
 		return;
 	}
 
-	log_write("normal request");
+	log_write("This request is from ITESLF\n");
 	// Process the request based on its type
 	switch (request->type) {
 		case OP_NOOP:
@@ -522,7 +522,7 @@ static bool process_server_message(int fd)
 			int key_srv_id = key_server_id(request->key, num_servers);
 			if (key_srv_id == server_id) {
 				// is in recovery, this is of primary table
-				log_write("sid %d: recovery: received primary, key %s, value %s\n", server_id, key_to_str(request->key), request->value);
+				log_write("sid %d: recovery: received primary entry, key %s, value %s\n", server_id, key_to_str(request->key), request->value);
 				hash_lock(&primary_hash, request->key);
 				if (!hash_put(&primary_hash, request->key, value_copy, value_size, &old_value, &old_value_sz))
 				{
@@ -604,8 +604,8 @@ void *update_primary()
 {	
 	hash_iterate(&secondary_hash, update_primary_iterator, NULL);
 	log_write("sid %d: recovery: send update primary FINSHED\n");
+	//sleep(50);
 	server_status = STATUS_UPDATED_PRIMARY;
-	sleep(5);
 
 	mserver_ctrl_request hb_req;
 	hb_req.type = UPDATED_PRIMARY;

@@ -589,10 +589,15 @@ static void process_client_message(int fd)
 	if (recovery.is_in && recovery.failed_sid == server_id) {
 		if (recovery.stop_write) {
 			// write stopped, dropped connection (TODO)
+			log_write("write stopped, dropped connection (TODO), for %d to %d\n", server_id, recovery.secondary_sid);
+
 			return;
 		} else {
+			log_write("relayed request for %d to %d\n", server_id, recovery.secondary_sid);
 			server_id = recovery.secondary_sid;
 		}
+	} else {
+		log_write("it's it self, handle \n");
 	}
 
 
