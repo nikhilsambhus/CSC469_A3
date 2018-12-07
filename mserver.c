@@ -546,6 +546,8 @@ static bool send_switch_primary(int sid)
 	recovery.updated_primary = false;
 	recovery.updated_secondary = false;
 	recovery.stop_write = false;
+	log_write("Primary switched, failure handle over\n");
+	log_write("----------------------------------------------------------------------------\n");
 	return true;
 }
 
@@ -767,7 +769,7 @@ static bool run_mserver_loop()
 				recovery.primary_sid = primary_server_id(failure_detected, num_servers);
 				recovery.secondary_sid = secondary_server_id(failure_detected, num_servers);
 
-				log_write("----------------------------------------------------------------------------");
+				log_write("----------------------------------------------------------------------------\n");
 				log_error("New Server failure detected, server id %d, its primary %d, its secondary %d\n", 
 				failure_detected, recovery.primary_sid, recovery.secondary_sid);
 				
@@ -775,7 +777,10 @@ static bool run_mserver_loop()
 					// respawn server success, start select() on its fd
 					server_node *node = &(server_nodes[failure_detected]);
 					FD_SET(node->socket_fd_in, &allset);
-
+					if (!send_set_secondary(failure_detected)) {
+						log_error("Fatal: respawn failed: set_secondaryfailed, server %d failed, exit gracefully\n", recovery.failed_sid);
+					return false;
+					}
 					// you want to send the UPDATE_PRIMARY to the secondary of the failed server, vice versa
 					send_update_primary(recovery.secondary_sid);
 					send_update_secondary(recovery.primary_sid);
