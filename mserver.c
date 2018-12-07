@@ -642,6 +642,8 @@ static bool process_server_message(int fd)
 			recovery.updated_primary = true;
 			if (recovery.updated_secondary) {
 				recovery.stop_write = true;
+				recovery.updated_primary = false;
+				recovery.updated_secondary = false;
 				send_switch_primary(recovery.secondary_sid);
 			}
 			return true;
@@ -650,6 +652,8 @@ static bool process_server_message(int fd)
 			recovery.updated_secondary = true;
 			if (recovery.updated_primary) {
 				recovery.stop_write = true;
+				recovery.updated_primary = false;
+				recovery.updated_secondary = false;
 				send_switch_primary(recovery.secondary_sid);
 			}
 			return true;
@@ -763,6 +767,7 @@ static bool run_mserver_loop()
 				recovery.primary_sid = primary_server_id(failure_detected, num_servers);
 				recovery.secondary_sid = secondary_server_id(failure_detected, num_servers);
 
+				log_write("----------------------------------------------------------------------------");
 				log_error("New Server failure detected, server id %d, its primary %d, its secondary %d\n", 
 				failure_detected, recovery.primary_sid, recovery.secondary_sid);
 				
@@ -784,7 +789,7 @@ static bool run_mserver_loop()
 			else if (recovery.failed_sid != failure_detected) {
 				// multiple failure detected
 				log_error("Fatal: multiple failure detected, new failure server %d, exit gracefully\n", failure_detected);
-				//return false;
+				return false;
 			} else {
 				// failure is being handled currently, do nothing 
 			}

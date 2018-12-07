@@ -331,6 +331,7 @@ static void process_client_message(int fd)
 					hash_lock(&secondary_hash, request->key);			
 					if(replicate_put(request, primary_fd) == false) {
 						response->status = SERVER_FAILURE;
+						hash_unlock(&secondary_hash, request->key);
 						break;
 					}
 					hash_unlock(&secondary_hash, request->key);
@@ -425,6 +426,7 @@ static void process_client_message(int fd)
 			hash_lock(&primary_hash, request->key);			
 			if(replicate_put(request, secondary_fd) == false) {
 				response->status = SERVER_FAILURE;
+				hash_unlock(&primary_hash, request->key);
 				break;
 			}
 			hash_unlock(&primary_hash, request->key);
